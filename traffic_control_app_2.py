@@ -4,13 +4,11 @@ import streamlit as st
 from ultralytics import YOLO
 from collections import defaultdict
 import time
-from streamlit_autorefresh import st_autorefresh
 
-st.set_page_config(layout="wide")  # <-- MUST be first Streamlit command
+from langchain.agents import initialize_agent, Tool
+from langchain_openai import ChatOpenAI
 
-# Auto-refresh every 5000 ms (5 seconds)
-st_autorefresh(interval=5000, limit=None, key="refresh")
-
+st.set_page_config(layout="wide")
 st.title("🚦 AI Traffic Control Agent with Video (OpenRouter)")
 
 api_key = st.text_input("Enter your OpenRouter API Key:", type="password")
@@ -20,10 +18,10 @@ model = YOLO("yolov8n.pt")
 lanes = ["North", "East", "West", "South"]
 
 video_paths = {
-    "North": r"D:\Downloads 2\ai_agent_TRAFFIC\vid1.mp4",
-    "East":  r"D:\Downloads 2\ai_agent_TRAFFIC\vid2.mp4",
-    "West":  r"D:\Downloads 2\ai_agent_TRAFFIC\vid3.mp4",
-    "South": r"D:\Downloads 2\ai_agent_TRAFFIC\vid4.mp4",
+    "North": "north.mp4",
+    "East": "east.mp4",
+    "West": "west.mp4",
+    "South": "south.mp4",
 }
 
 EMA_ALPHA = 0.3
@@ -33,10 +31,6 @@ if "lane_status" not in st.session_state:
     st.session_state.lane_status = {ln: "RED" for ln in lanes}
 if "last_decision_time" not in st.session_state:
     st.session_state.last_decision_time = 0
-if "caps" not in st.session_state:
-    st.session_state.caps = {ln: cv2.VideoCapture(video_paths[ln]) for ln in lanes}
-if "frame_pos" not in st.session_state:
-    st.session_state.frame_pos = {ln: 0 for ln in lanes}
 
 LANE_ROIS = {ln: ((0, 0), (640, 480)) for ln in lanes}
 
@@ -69,17 +63,11 @@ def draw_signal_overlay(img, lane):
 def get_vehicle_counts_and_show():
     counts = {}
     for ln in lanes:
-        cap = st.session_state.caps[ln]
-        # Set frame position and read next frame
-        cap.set(cv2.CAP_PROP_POS_FRAMES, st.session_state.frame_pos[ln])
+        cap = cv2.VideoCapture(video_paths[ln])
         ret, frame = cap.read()
         if not ret:
-            # Loop video if end reached
-            st.session_state.frame_pos[ln] = 0
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            ret, frame = cap.read()
-            if not ret:
-                continue
+            cap.release()
+            continue
         frame = cv2.resize(frame, (640, 480))
         results = model(frame, conf=0.35, iou=0.5, classes=[2, 3, 5, 7])[0]
         count = 0
@@ -93,51 +81,8 @@ def get_vehicle_counts_and_show():
         st.session_state.ema_counts[ln] = EMA_ALPHA * count + (1 - EMA_ALPHA) * st.session_state.ema_counts[ln]
         counts[ln] = int(round(st.session_state.ema_counts[ln]))
         frame_placeholders[ln].image(annotated, channels="BGR", use_container_width=True)
-        # Advance frame position for next run
-        st.session_state.frame_pos[ln] += 1
+        cap.release()
     return counts
-
-def get_vehicle_counts_batch(batch_size=20):
-    counts = {}
-    for ln in lanes:
-        cap = st.session_state.caps[ln]
-        lane_counts = []
-        for _ in range(batch_size):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, st.session_state.frame_pos[ln])
-            ret, frame = cap.read()
-            if not ret:
-                st.session_state.frame_pos[ln] = 0
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                ret, frame = cap.read()
-                if not ret:
-                    continue
-            frame = cv2.resize(frame, (640, 480))
-            results = model(frame, conf=0.35, iou=0.5, classes=[2, 3, 5, 7])[0]
-            count = 0
-            for r in results.boxes:
-                x1, y1, x2, y2 = map(int, r.xyxy[0])
-                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-                if in_rect(cx, cy, LANE_ROIS[ln]):
-                    count += 1
-            lane_counts.append(count)
-            st.session_state.frame_pos[ln] += 1
-        # Use EMA of batch counts for decision
-        if lane_counts:
-            batch_ema = EMA_ALPHA * np.mean(lane_counts) + (1 - EMA_ALPHA) * st.session_state.ema_counts[ln]
-        else:
-            batch_ema = st.session_state.ema_counts[ln]
-        st.session_state.ema_counts[ln] = batch_ema
-        counts[ln] = int(round(batch_ema))
-        # Show last frame in batch
-        if lane_counts:
-            annotated = results.plot()
-            annotated = draw_signal_overlay(annotated, ln)
-            frame_placeholders[ln].image(annotated, channels="BGR", use_container_width=True)
-    return counts
-
-def get_vehicle_counts_tool(_):
-    # Use batch of 20 frames and EMA for decision
-    return get_vehicle_counts_batch(batch_size=20)
 
 def change_signal(lane):
     for ln in lanes:
@@ -145,17 +90,17 @@ def change_signal(lane):
     st.session_state.lane_status[lane] = "GREEN"
     return f"Signal changed: {lane} is GREEN, others RED."
 
-def show_status(_):
+def show_status():
     return st.session_state.lane_status
+
+def get_vehicle_counts_tool():
+    return get_vehicle_counts_and_show()
 
 tools = [
     Tool(name="GetVehicleCounts", func=get_vehicle_counts_tool, description="Get the estimated vehicle count in each lane."),
     Tool(name="ChangeSignal", func=change_signal, description="Change the traffic light to green for a chosen lane."),
     Tool(name="ShowStatus", func=show_status, description="See the current traffic light status."),
 ]
-
-TARGET_FPS = 15  # Set your comfortable frame rate here (e.g., 10-15 FPS)
-frame_delay = 1.0 / TARGET_FPS
 
 if api_key:
     llm = ChatOpenAI(
@@ -167,20 +112,15 @@ if api_key:
 
     agent = initialize_agent(tools, llm, agent="zero-shot-react-description", verbose=True)
 
-    counts = get_vehicle_counts_batch(batch_size=20)
-    stats_placeholder.write(f"**Vehicle Counts (EMA, 20-frame batch):** {counts}")
+    counts = get_vehicle_counts_and_show()
+    stats_placeholder.write(f"**Vehicle Counts (EMA):** {counts}")
 
     now = time.time()
     if now - st.session_state.last_decision_time > 30:
-        # The agent will use EMA counts for decision
-        decision = agent.run("Use GetVehicleCounts, then select exactly one lane with ChangeSignal to minimize total waiting time using EMA vehicle counts.")
+        decision = agent.run("Use GetVehicleCounts, then select exactly one lane with ChangeSignal to minimize total waiting time.")
         decision_placeholder.success(decision)
         st.session_state.last_decision_time = now
 
     st.write("🚦 Current Signals:", st.session_state.lane_status)
-
-    if st.button("Next Batch (20 Frames)"):
-        pass  # Reruns and processes next batch
-
 else:
     st.warning("Please enter your OpenRouter API key to start the AI agent.")
